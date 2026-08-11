@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# VS Code
+.vscode/
+
+# Cache
+.research_cache/
+.cache/
+
+# Downloaded ML models
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# Generated research database
+research_db/
+
+# Generated vector-store data
+vector_store/chroma/
+vector_store/chroma_db/
+vector_store/*.db
+vector_store/*.sqlite
+vector_store/*.sqlite3
+
+# Generated media
+*.mp3
+*.wav
+*.mp4
+*.avi
+*.mov
+
+# Generated images
+*.png
+*.jpg
+*.jpeg
+
+# Logs
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Archives
+*.zip
+*.tar
+*.gz
