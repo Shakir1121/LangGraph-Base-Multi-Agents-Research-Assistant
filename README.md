@@ -92,3 +92,26 @@ Critic Review
  │
  ▼
 Final Research Report
+## 🛠️ Technologies
+
+- Python
+- LangGraph
+- LangChain
+- LLMs
+- RAG
+- ChromaDB
+- FAISS
+- ArXiv
+- OpenAlex
+- Tavily
+- Streamlit
+- Sentence Transformers
+
+---
+
+## 🎯 Example
+
+### Input
+
+```text
+LLM-based Text Summarization
