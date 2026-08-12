@@ -1,72 +1,67 @@
-import os
 import logging
+import os
+
 from dotenv import load_dotenv
 from tavily import TavilyClient
 
+
 load_dotenv()
+
 logger = logging.getLogger(__name__)
 
 
-def tavily_search(query, max_results=5):
-    """
-    Search using Tavily API
-    
-    Args:
-        query: Search query string
-        max_results: Maximum number of results (default 5)
-    
-    Returns:
-        List of search results with title, content, and url
-    """
-    try:
-        api_key = os.getenv("TAVILY_API_KEY")
-        if not api_key:
-            logger.warning(" No Tavily API key found in environment")
-            return []
+def tavily_search(query: str, max_results: int = 5):
+    """Search Tavily and return normalized results."""
 
-        logger.info(f"🔍 Tavily: Searching '{query[:50]}...' (max_results={max_results})")
+    api_key = os.getenv("TAVILY_API_KEY")
+
+    if not api_key:
+        logger.warning("TAVILY_API_KEY is not configured.")
+        return []
+
+    try:
+        logger.info(
+            f"Tavily search: '{query[:50]}...' "
+            f"(max_results={max_results})"
+        )
+
         client = TavilyClient(api_key=api_key)
 
-        # Make the API call
         response = client.search(
             query=query,
             search_depth="advanced",
-            max_results=max_results
+            max_results=max_results,
         )
-        
-        logger.debug(f"📨 Tavily raw response type: {type(response)}")
-        
-        # Handle different response formats
+
         if isinstance(response, dict):
             results = response.get("results", [])
-            logger.info(f" Tavily: Got response with {len(results)} results")
-            
-            processed = [
-                {
-                    "title": r.get("title", ""),
-                    "content": r.get("content", ""),
-                    "url": r.get("url", "")
-                }
-                for r in results
-            ]
-            return processed
-        
         elif isinstance(response, list):
-            logger.info(f" Tavily: Got list response with {len(response)} items")
-            processed = [
-                {
-                    "title": r.get("title", ""),
-                    "content": r.get("content", ""),
-                    "url": r.get("url", "")
-                }
-                for r in response
-            ]
-            return processed
-        
+            results = response
         else:
-            logger.warning(f" Tavily: Unexpected response type: {type(response)}")
+            logger.warning(
+                f"Unexpected Tavily response type: {type(response)}"
+            )
             return []
 
-    except Exception as e:
-        logger.error(f" Tavily failed: {e}", exc_info=True)
+        processed = [
+            {
+                "title": result.get("title", ""),
+                "content": result.get("content", ""),
+                "url": result.get("url", ""),
+            }
+            for result in results[:max_results]
+            if isinstance(result, dict)
+        ]
+
+        logger.info(
+            f"Tavily returned {len(processed)} result(s)"
+        )
+
+        return processed
+
+    except Exception as exc:
+        logger.error(
+            f"Tavily search failed: {exc}",
+            exc_info=True,
+        )
         return []

@@ -1,55 +1,127 @@
+import logging
+import re
+
 from research_module.llm.chains import ideas_chain
 
 
-def idea_agent(state):
-    topic = state["query"]
-    papers = state.get("retrieved_docs", [])
-    ranked_papers = state.get("ranked_papers", "")
+logger = logging.getLogger(__name__)
 
-    # Format papers with abstracts for better context.
-    papers_context = _format_papers_with_abstracts(papers, ranked_papers)
+MAX_PAPERS = 6
+MAX_ABSTRACT_CHARS = 500
+
+
+def idea_agent(state: dict) -> dict:
+    """Generate research ideas from the topic and retrieved evidence."""
+    topic = str(state.get("query", "")).strip()
+    papers = state.get("retrieved_docs") or []
+
+    papers_context = _format_papers(papers)
+    web_context = str(state.get("web_context") or "")[:3000]
+
+    logger.info("Generating research ideas.")
 
     result = ideas_chain.invoke(
         {
             "topic": topic,
             "papers_context": papers_context,
-            "web_context": state.get("web_context", ""),
-            "session_id": state.get("session_id"),
+            "web_context": web_context,
         }
     )
 
-    return {"ideas": result}
+    ideas = _clean_idea_output(str(result or "").strip())
+
+    logger.info("Research idea generation completed.")
+
+    return {
+        "ideas": ideas
+    }
 
 
-def _format_papers_with_abstracts(papers, ranked_papers):
-    """Format papers with abstracts for better context in prompts"""
+def _format_papers(papers: list) -> str:
+    """Format retrieved papers into a compact prompt context."""
     if not papers:
-        return "(No papers retrieved - ideas will be based on topic and web context)"
+        return "(No papers retrieved.)"
 
     formatted = []
-    for i, paper in enumerate(papers[:10], start=1):  # Limit to first 10 papers
+
+    for index, paper in enumerate(papers[:MAX_PAPERS], start=1):
         if isinstance(paper, dict):
-            title = paper.get("title", "Unknown Title")
-            abstract = paper.get("content") or paper.get("abstract") or "No abstract available"
-            url = paper.get("url", "")
-            authors = paper.get("authors", "")
+            title = str(paper.get("title") or "Unknown title").strip()
+            abstract = str(
+                paper.get("content")
+                or paper.get("abstract")
+                or ""
+            ).strip()
+            url = str(paper.get("url") or "").strip()
 
-            # Truncate abstract if too long
-            if len(abstract) > 300:
-                abstract = abstract[:300] + "..."
+            abstract = _truncate(abstract, MAX_ABSTRACT_CHARS)
 
-            entry = f"[Paper {i}]\nTitle: {title}"
-            if authors:
-                entry += f"\nAuthors: {authors}"
-            entry += f"\nAbstract: {abstract}"
+            text = (
+                f"[Paper {index}]\n"
+                f"Title: {title}\n"
+                f"Abstract: {abstract}"
+            )
+
             if url:
-                entry += f"\nURL: {url}"
-            formatted.append(entry)
-        else:
-            # Handle string papers
-            paper_str = str(paper).strip()
-            if len(paper_str) > 300:
-                paper_str = paper_str[:300] + "..."
-            formatted.append(f"[Paper {i}]\n{paper_str}")
+                text += f"\nURL: {url}"
 
-    return "\n\n".join(formatted) if formatted else "(No papers retrieved - ideas will be based on topic and web context)"
+        else:
+            text = _truncate(str(paper).strip(), MAX_ABSTRACT_CHARS)
+            text = f"[Paper {index}]\n{text}"
+
+        formatted.append(text)
+
+    return "\n\n".join(formatted)
+
+
+def _truncate(text: str, max_length: int) -> str:
+    """Limit text length while keeping the output readable."""
+    if len(text) <= max_length:
+        return text
+
+    return text[:max_length] + "..."
+
+
+def _clean_idea_output(text: str) -> str:
+    """Remove extra ideas and duplicate blocks from the model output."""
+    if not text:
+        return ""
+
+    text = _keep_first_ten_ideas(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    blocks = re.split(r"\n\s*\n", text)
+
+    seen = set()
+    cleaned = []
+
+    for block in blocks:
+        block = block.strip()
+
+        if not block:
+            continue
+
+        normalized = re.sub(r"\s+", " ", block).lower()
+
+        if normalized in seen:
+            continue
+
+        seen.add(normalized)
+        cleaned.append(block)
+
+    return "\n\n".join(cleaned).strip()
+
+
+def _keep_first_ten_ideas(text: str) -> str:
+    """Discard content starting from Idea 11."""
+    match = re.search(
+        r"(?im)^\s*(?:#{1,6}\s*)?"
+        r"(?:\*\*)?\s*idea\s+1[1-9]"
+        r"\s*[:.)-]",
+        text,
+    )
+
+    if match:
+        return text[:match.start()].rstrip()
+
+    return text

@@ -1,13 +1,14 @@
-import os
+import hashlib
 import logging
+import os
 
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+
 
 logger = logging.getLogger(__name__)
 
-
-for _noisy in (
+for module in (
     "httpx",
     "httpcore",
     "huggingface_hub",
@@ -21,14 +22,21 @@ for _noisy in (
     "filelock",
     "chromadb",
 ):
-    logging.getLogger(_noisy).setLevel(logging.ERROR)
+    logging.getLogger(module).setLevel(logging.ERROR)
 
-MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./research_db/chroma")
+
+MODEL_NAME = os.getenv(
+    "EMBEDDING_MODEL",
+    "sentence-transformers/all-MiniLM-L6-v2",
+)
+
+PERSIST_DIR = os.getenv(
+    "CHROMA_PERSIST_DIR",
+    "./research_db/chroma",
+)
 
 
 def _get_embeddings():
-    """Return a shared LangChain embedding model."""
     return HuggingFaceEmbeddings(
         model_name=MODEL_NAME,
         model_kwargs={"device": "cpu"},
@@ -39,49 +47,77 @@ def _get_embeddings():
 _vectorstore = Chroma(
     collection_name="research_papers",
     embedding_function=_get_embeddings(),
-    persist_directory=_PERSIST_DIR,
+    persist_directory=PERSIST_DIR,
 )
 
 
+def _paper_id(title: str, content: str) -> str:
+    value = f"{title}|{content[:500]}"
+    return hashlib.md5(value.encode("utf-8")).hexdigest()
+
+
 def store_papers(papers):
-    """Index papers into the LangChain Chroma vector store."""
     if not papers:
-        logger.warning("🗄️ store_papers: no papers to store")
+        logger.warning("No papers to store.")
         return
 
     ids = []
-    docs = []
-    metas = []
+    documents = []
+    metadatas = []
 
-    for i, p in enumerate(papers):
-        content = p.get("content") or p.get("summary") or ""
+    for paper in papers:
+        content = (
+            paper.get("content")
+            or paper.get("summary")
+            or paper.get("abstract")
+            or ""
+        ).strip()
+
         if not content:
             continue
-        title = p.get("title", "")
-        url = p.get("url", "")
-        docs.append(content)
-        metas.append({"title": title, "url": url})
-        # Stable id per paper to avoid duplicate inserts on re-runs.
-        ids.append(f"{i}-{abs(hash(title or content[:50]))}")
 
-    if docs:
-        _vectorstore.add_texts(texts=docs, metadatas=metas, ids=ids)
-        logger.info(f"🗄️ store_papers: stored {len(docs)} paper(s) in Chroma")
+        title = paper.get("title", "").strip()
+        url = paper.get("url", "").strip()
+
+        documents.append(content)
+        metadatas.append({
+            "title": title,
+            "url": url,
+        })
+        ids.append(_paper_id(title, content))
+
+    if not documents:
+        logger.warning("No valid paper content found.")
+        return
+
+    _vectorstore.add_texts(
+        texts=documents,
+        metadatas=metadatas,
+        ids=ids,
+    )
+
+    logger.info(
+        f"Stored {len(documents)} paper(s) in Chroma."
+    )
 
 
 def retrieve(query, top_k=5):
-    """Retrieve documents from Chroma, returning dicts for downstream agents."""
-    docs = _vectorstore.similarity_search(query, k=top_k)
+    docs = _vectorstore.similarity_search(
+        query,
+        k=top_k,
+    )
+
     return [
         {
-            "title": d.metadata.get("title", ""),
-            "content": d.page_content,
-            "url": d.metadata.get("url", ""),
+            "title": doc.metadata.get("title", ""),
+            "content": doc.page_content,
+            "url": doc.metadata.get("url", ""),
         }
-        for d in docs
+        for doc in docs
     ]
 
 
 def as_retriever(top_k=5):
-    """Return a LangChain retriever backed by the Chroma vector store."""
-    return _vectorstore.as_retriever(search_kwargs={"k": top_k})
+    return _vectorstore.as_retriever(
+        search_kwargs={"k": top_k}
+    )

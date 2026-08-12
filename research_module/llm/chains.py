@@ -1,218 +1,324 @@
-"""LangChain components for the research pipeline.
-
-Centralises every prompt as a built-in :class:`ChatPromptTemplate` and
-exposes each agent as an LCEL runnable (``prompt | llm | parser``).
-
-Two flavours are provided:
-
-* **Memory-backed chains** (``*_chain``) — used by the Research Idea
-  Generator. They inject the session's chat history via the existing
-  ``llm_with_memory`` helper and return a plain string. Created with
-  :func:`build_memory_chain`.
-* **Structured chains** (``paper_*_chain``) — used by the Paper QA
-  pipeline. They are pure ``prompt | llm | StrOutputParser`` runnables.
-"""
-
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 
-from research_module.llm.mistral_llm import (
-    get_llm,
-    _build_messages,
-    _persist_turn,
-    _truncate_prompt,
-)
+from research_module.llm.mistral_llm import get_llm
 
 
-
-# Generic runnable builder (memory-backed, streaming-capable)
-
-def build_memory_chain(template: ChatPromptTemplate):
-    """Wrap a prompt template into a streaming LCEL runnable with chat history.
-
-    The runnable accepts a dict of template variables plus an optional
-    ``session_id`` key. It formats the prompt, injects the session's chat
-    history, and composes the ``ChatMistralAI`` model directly in the LCEL
-    pipe. Because the model is part of the runnable tree, LangGraph's
-    ``astream_events`` can emit real ``on_chat_model_stream`` token events,
-    giving the UI ChatGPT-style streaming output. The completed turn is
-    persisted to history once streaming finishes.
-    """
-
-    def _prepare(inputs: dict) -> dict:
-        vars_ = {k: v for k, v in inputs.items() if k != "session_id"}
-        prompt_text = _truncate_prompt(template.format(**vars_))
-        session_id = inputs.get("session_id")
-        return {
-            "prompt": prompt_text,
-            "session_id": session_id,
-            "messages": _build_messages(prompt_text, session_id),
-        }
-
-    def _pick_messages(payload: dict):
-        return payload["messages"]
-
-    def _persist(payload: dict) -> str:
-        _persist_turn(payload["prompt"], payload["response"], payload["session_id"])
-        return payload["response"]
-
-    return (
-        RunnableLambda(_prepare)
-        | RunnablePassthrough.assign(
-            response=RunnableLambda(_pick_messages) | get_llm() | StrOutputParser()
-        )
-        | RunnableLambda(_persist)
-    )
-
-
-
-# Research Idea Generator — prompt templates
+def _build_chain(prompt: ChatPromptTemplate):
+    return prompt | get_llm() | StrOutputParser()
 
 
 _query_planner_template = ChatPromptTemplate.from_template(
-    """You are a research planner generating queries for the arXiv and Semantic
-Scholar APIs.
+    """
+You are an academic research search-query planner.
 
 Research topic:
 {query}
 
-Existing web context (use only as background, do not quote):
+Web context:
 {web_context}
 
-Produce EXACTLY 4 search queries, one per line. The first 3 are academic
-search queries, the 4th targets a relevant dataset.
+Generate exactly ONE strong academic search query.
 
-Hard constraints — these APIs reject malformed input:
-- Plain text only. No bullets, numbers, asterisks, quotes, colons, or labels.
-- Each line <= 12 words and <= 120 characters.
-- Use keywords and noun phrases, not full sentences or boolean operators.
-- No newlines inside a query.
+Rules:
+- One line only.
+- 3-10 meaningful words.
+- No numbering.
+- No bullets.
+- No JSON.
+- No explanation.
+- Focus on the research problem and technical domain.
 
-Output: 4 lines, nothing else."""
+Output ONLY the query.
+"""
 )
+
 
 _ideas_template = ChatPromptTemplate.from_template(
-    """You are a senior research scientist generating novel research ideas.
+    """
+You are a senior academic researcher and research supervisor.
 
-RESEARCH TOPIC: {topic}
+Research Topic:
+{topic}
 
-RELATED PAPERS (with abstracts for reference):
+Relevant Research Papers:
 {papers_context}
 
-WEB CONTEXT & CURRENT STATE:
+Current Web Context:
 {web_context}
 
-TASK: Generate 10 original research ideas grounded in the topic and papers above.
+TASK
+Generate EXACTLY 10 distinct and publication-oriented research ideas.
 
-For EACH idea, provide a title followed by EXACTLY these three headings, in this order:
-**Title**: Clear, specific research title
+The ideas must be meaningfully different from one another.
 
-**Problem Statement**: A short, eye-catching 1-2 sentence text that grabs attention and states the core problem this idea solves.
+For EVERY idea use exactly this structure:
 
-**Abstract**: A 3-4 sentence summary of the research idea in simple, easy words that a researcher can quickly understand. Explain what the idea is, the approach, and why it is novel.
+## Idea 1: <Research Title>
 
-**Methodology**: Provide the technical steps AND the dataset details for this idea. Name 2-3 concrete, real datasets (e.g., CNN/DailyMail, XSum, PubMed, SAMSum, FEVER, ESG, SummEval) with a short note on how each will be used. If a public dataset link is available, include the URL so the researcher can access it directly. Also give the key evaluation metrics (e.g., ROUGE, BERTScore, FactCC).
+### Problem Statement
+<2-4 sentences explaining the specific real-world or scientific problem,
+why it matters, what existing systems fail to solve, and what gap motivates
+this research.>
 
-STRICT OUTPUT RULES:
-- Output the ideas directly. Do NOT add a long intro paragraph, a "Cross-Cutting
-  Research Directions" section, "Key Questions for Future Work", or "Next Steps"
-  at the end. Stop after idea 10.
-- Make each idea distinct - do not repeat the same phrasing or approach across ideas.
-- Ground each idea in the topic and the related papers/web context above.
-Format each idea with a blank line between them."""
+### Proposed Research Direction
+<2-4 sentences explaining the proposed research direction and the main
+technical concept.>
+
+### Dataset Direction
+<Name a realistic dataset type, source, or dataset characteristics that
+would be appropriate. If a specific public dataset is uncertain, describe
+the required dataset characteristics instead of inventing a dataset.>
+
+### Novelty
+<1-2 sentences describing what could make this research different from
+existing work.>
+
+### Expected Contribution
+<1-2 sentences describing the expected scientific or practical contribution.>
+
+### Feasibility
+<1 sentence explaining why the project is realistically implementable.>
+
+Repeat the same structure for Idea 2 through Idea 10.
+
+STRICT RULES:
+
+1. EXACTLY 10 ideas.
+2. Never generate Idea 11.
+3. Every idea must be distinct.
+4. Do not repeat the same research problem with different wording.
+5. Do not copy paragraphs between ideas.
+6. Do not create a generic introduction.
+7. Do not create a conclusion.
+8. Do not generate a complete methodology for every idea.
+9. Do not generate a complete proposal for every idea.
+10. Do not fabricate specific dataset statistics.
+11. Dataset information must be realistic and clearly qualified.
+12. Keep each idea detailed but concise.
+13. Focus on research novelty and publication potential.
+14. Stop immediately after Idea 10.
+"""
 )
+
 
 _selector_template = ChatPromptTemplate.from_template(
-    """You are a strict AI research paper reviewer.
+    """
+You are a strict academic research supervisor.
 
-Task: Select ONLY ONE best idea.
-
-Research topic:
+Research Topic:
 {topic}
 
-Ideas:
+Candidate Research Ideas:
 {ideas}
 
-Return ONLY this compact format:
+Select exactly ONE strongest research idea.
 
-SELECTED IDEA:
-<improved, fully-written idea in 4-6 sentences>
+Evaluate:
 
-WHY SELECTED:
 - Novelty
-- Technical Depth
+- Research gap
+- Technical depth
+- Dataset availability
 - Feasibility
-- Publication Strength
+- Experimental potential
+- Publication potential
+- Reproducibility
 
-Keep it short. Do NOT include a long reviewer essay, scoring tables, "Final
-Verdict", or "Suggested Next Steps"."""
+Return ONLY:
+
+# Selected Research Idea
+
+## Title
+<exact selected title>
+
+## Selection Rationale
+<one concise paragraph>
+
+## Why This Idea Is Strong
+
+### Novelty
+<short explanation>
+
+### Technical Depth
+<short explanation>
+
+### Dataset Feasibility
+<short explanation>
+
+### Publication Potential
+<short explanation>
+
+## Recommended Research Direction
+<short explanation>
+
+IMPORTANT:
+- Select only ONE idea.
+- Do not reproduce all ten ideas.
+- Do not write the complete proposal.
+- Do not repeat large portions of the candidate ideas.
+"""
 )
 
+
 _gaps_template = ChatPromptTemplate.from_template(
-    """Research Topic:
+    """
+You are an expert academic researcher.
+
+Research Topic:
 {topic}
 
-Selected Idea:
+Selected Research Idea:
 {selected_idea}
 
-Papers Context:
+Relevant Papers:
 {papers}
 
 Web Context:
 {web_context}
 
-Identify the key research gaps directly related to the selected idea above.
+Identify the most important research gaps that directly justify the
+selected research idea.
 
-STRICT OUTPUT RULES:
-- Output ONLY a concise bulleted list of concrete, distinct research gaps.
-- Each gap must be a real, specific deficiency in the literature/area, stated
-  as one short bullet (1-2 sentences max).
-- NEVER repeat the selected idea, the papers, or any proposal.
-- NEVER include headings, headings text like "Novelty", "Technical Depth",
-  "Dataset Feasibility", "Publication Potential", "Why This Is the Best Idea",
-  scores, evaluations, or reviews.
-- NEVER include an introduction, conclusion, roadmap, timeline, or any
-  narrative. Just the bullets, nothing else.
-Iterate the 3-5 most important gaps as a simple bullet list."""
+Return exactly 4-6 numbered gaps.
+
+For each gap use:
+
+### Gap 1
+**Existing Limitation:** <specific limitation>
+
+**Why It Matters:** <why the limitation is scientifically important>
+
+**Opportunity:** <how the proposed research can address it>
+
+STRICT RULES:
+- Every gap must be specific.
+- Do not repeat the selected idea.
+- Do not repeat the same gap using different wording.
+- Do not write methodology.
+- Do not write a proposal.
+- Do not write a conclusion.
+- Do not invent unsupported claims.
+"""
 )
 
+
 _methodology_template = ChatPromptTemplate.from_template(
-    """Research Topic:
+    """
+You are an expert AI/ML research scientist.
+
+Research Topic:
 {topic}
 
-Selected Idea:
+Selected Research Idea:
 {selected_idea}
 
 Research Gaps:
 {gaps}
 
-Retrieved Papers:
+Relevant Papers:
 {papers}
 
-Create a strict technical methodology for the selected idea above.
+Create a detailed and implementable methodology.
 
-STRICT OUTPUT RULES:
-- Output ONLY the methodology section: the concrete technical steps to build
-  the system for the selected idea.
-- Structure it with clear sub-sections: Dataset, Models, Training Strategy,
-  Augmentation, Metrics, Deployment Plan, Challenges.
-- Focus ONLY on the how-to-implement for the selected idea. Do NOT restate the
-  selected idea or the research gaps verbatim.
-- NEVER include headings like "Novelty", "Technical Depth", "Dataset
-  Feasibility", "Publication Potential", "Why This Is the Best Idea", any
-  scores, evaluations, reviews, roadmap, or timeline.
-- NEVER add an introduction or conclusion.
-Output strictly the methodology content."""
+Use EXACTLY these sections:
+
+# Methodology
+
+## 1. Dataset and Data Sources
+
+Explain:
+- Dataset type
+- Possible public datasets
+- Required variables/features
+- Target variable if applicable
+- Expected data format
+- Dataset size requirements
+- Train/validation/test split
+
+Do not invent exact dataset statistics unless supported by the supplied
+context.
+
+## 2. Data Preprocessing
+
+Explain:
+- Cleaning
+- Missing values
+- Duplicates
+- Outliers
+- Encoding
+- Normalization/scaling
+- Class imbalance if applicable
+
+## 3. Feature Engineering
+
+Explain the important features and transformations.
+
+## 4. Proposed Architecture
+
+Describe the complete system architecture step by step.
+
+## 5. Baseline Models
+
+List suitable baseline approaches and explain why they are needed.
+
+## 6. Proposed Model
+
+Explain the proposed model and how it differs from the baselines.
+
+## 7. Training Strategy
+
+Explain:
+- Loss function
+- Optimizer
+- Hyperparameter tuning
+- Cross-validation
+- Early stopping where appropriate
+
+## 8. Experimental Design
+
+Explain the experiments required to test the research hypothesis.
+
+## 9. Evaluation Metrics
+
+Select metrics appropriate for the task and explain each metric.
+
+## 10. Ablation and Comparative Experiments
+
+Explain what components should be removed or changed to verify the
+contribution of the proposed approach.
+
+## 11. Reproducibility
+
+Explain seeds, configuration management, experiment tracking and
+documentation.
+
+## 12. Deployment or Practical Validation
+
+Explain how the final system could be evaluated in a realistic setting.
+
+## 13. Challenges and Risk Mitigation
+
+Identify realistic technical risks and corresponding solutions.
+
+IMPORTANT:
+- Do not repeat the full research proposal.
+- Do not write a generic conclusion.
+- Avoid repeating the same paragraph.
+- Keep the methodology technically actionable.
+"""
 )
 
-_proposal_template = ChatPromptTemplate.from_template(
-    """You are an academic researcher writing ONE cohesive research proposal.
 
-Topic:
+_proposal_template = ChatPromptTemplate.from_template(
+    """
+You are an academic researcher writing a Master's-level research proposal.
+
+Research Topic:
 {topic}
 
-Selected Idea:
+Selected Research Idea:
 {selected_idea}
 
 Research Gaps:
@@ -221,101 +327,195 @@ Research Gaps:
 Methodology:
 {methodology}
 
-Ranked Papers:
+Relevant Ranked Papers:
 {ranked_papers}
 
-Generate a single full research proposal for the selected idea.
+Write ONE coherent research proposal focused ONLY on the selected idea.
 
-STRICT OUTPUT RULES:
-- Present ONE coherent proposal titled by its research title.
-- Sections to include, in order:
-  1. Title
-  2. Abstract
-  3. Problem Statement
-  4. Literature Gap
-  5. Methodology
-  6. Dataset
-  7. Models
-  8. Metrics
-  9. Timeline
-  10. Expected Results
-- Write each section's content concretely and distinctively.
-- NEVER repeat or echo the ideas/overall review boilerplate, scoring rubrics
-  (Novelty/Technical Depth/Dataset Feasibility/Publication Potential), "Why This
-  Is the Best Idea", "Implementation Roadmap", or "Final Evaluation".
-- Do NOT start with "Final Evaluation & Selection" or any review framing.
-Output strictly the proposal."""
+Use EXACTLY this order:
+
+# Research Proposal
+
+## 1. Research Title
+
+## 2. Abstract
+
+## 3. Background and Context
+
+## 4. Detailed Problem Statement
+
+Explain:
+- The real-world/scientific problem
+- Why it matters
+- Current limitations
+- Who/what is affected
+- Why existing approaches are insufficient
+
+## 5. Research Aim
+
+## 6. Research Objectives
+
+Provide 4-6 measurable objectives.
+
+## 7. Research Questions
+
+Provide 3-5 research questions.
+
+## 8. Literature Gap
+
+Connect the research gaps to the proposed work without copying the
+entire earlier gap section.
+
+## 9. Proposed Solution
+
+Explain the high-level solution.
+
+## 10. Dataset and Data Requirements
+
+Explain:
+- Dataset source/type
+- Features
+- Target
+- Data requirements
+- Preprocessing requirements
+- Train/validation/test strategy
+
+Do not fabricate exact statistics.
+
+## 11. Proposed Methodology
+
+Summarize the detailed methodology in a proposal-friendly form.
+
+## 12. Experimental Design
+
+Describe the experiments and comparisons.
+
+## 13. Evaluation Metrics
+
+Explain the selected metrics.
+
+## 14. Expected Results
+
+Describe expected outcomes without claiming results that have not
+actually been obtained.
+
+## 15. Expected Research Contributions
+
+List the scientific and practical contributions.
+
+## 16. Limitations
+
+Describe realistic limitations.
+
+## 17. Future Work
+
+Describe realistic extensions.
+
+## 18. Conclusion
+
+Provide a concise proposal conclusion.
+
+IMPORTANT:
+- Do not reproduce the ten original ideas.
+- Do not repeat the methodology word-for-word.
+- Do not claim experiments have already been completed.
+- Do not invent numerical results.
+- Do not fabricate dataset statistics.
+- Avoid duplicate paragraphs.
+"""
 )
+
 
 _critic_template = ChatPromptTemplate.from_template(
-    """You are a senior research paper reviewer.
+    """
+You are a senior academic research reviewer.
 
-Review the following research proposal strictly as a CONSTRUCTIVE critic.
-
-Proposal:
+Research Proposal:
 {proposal}
 
-STRICT OUTPUT RULES:
-- Provide ONLY a concise, focused critique with these bullet sections:
-  * Strengths (3 bullets)
-  * Weaknesses (3 bullets)
-  * Specific Improvements (3 bullets)
-- Give a short Overall Score line at the end (e.g. "Overall: 8/10").
-- Do NOT re-add the proposal's own sections or content.
-- Do NOT include "Novelty (1-10)", "Technical Depth", "Dataset Feasibility",
-  "Publication Potential" rubrics, "Why This Idea Wins", "Implementation
-  Roadmap", "Key Recommendations", or any "Final Evaluation & Selection"
-  framing.
-- Keep it distinct and short. Output strictly the critique."""
+Review the proposal constructively.
+
+Return EXACTLY:
+
+## Strengths
+
+1. <point>
+2. <point>
+3. <point>
+
+## Weaknesses
+
+1. <point>
+2. <point>
+3. <point>
+
+## Specific Improvements
+
+1. <point>
+2. <point>
+3. <point>
+
+## Overall Score
+
+<score>/10
+
+## Publication Readiness
+
+<Low / Moderate / High> — <one sentence explanation>
+
+Rules:
+- Do not rewrite the proposal.
+- Do not repeat large portions of it.
+- Do not invent experimental results.
+"""
 )
+
 
 _ranker_template = ChatPromptTemplate.from_template(
-    """You are ranking academic papers for a research project on: {query}
+    """
+You are ranking academic papers for:
 
-IMPORTANT: Below are the candidate papers that YOU MUST RANK. Do NOT ask for papers - they are already provided.
+Research Topic:
+{query}
 
-Your task: Rank the top {num_to_rank} most relevant papers by this weighted criteria:
-- Relevance to the topic (highest weight - 50%)
-- Novelty/recency (25%)
-- Technical depth (25%)
-
-Return results as a numbered list with:
-  Number. Title — One-sentence reason explaining the ranking — URL (if available)
-
-CANDIDATE PAPERS TO RANK:
+Candidate Papers:
 {compact_papers}
 
-IMPORTANT: Return ONLY the ranked papers in the format above. Do not ask for more information or say papers are missing."""
+Rank the top {num_to_rank} most relevant papers.
+
+Criteria:
+- Relevance: 50%
+- Novelty/recency: 25%
+- Technical depth: 25%
+
+Return:
+
+1. Title — short reason — URL
+2. Title — short reason — URL
+
+Continue for the requested number.
+
+Do not invent paper titles or URLs.
+Do not ask for additional papers.
+"""
 )
 
 
-# Research Idea Generator — runnables
-#
-# All memory-backed chains share the same builder, so they are created from a
-# simple (variable_name, template) registry instead of eight repetitive calls.
-_MEMORY_CHAINS = [
-    ("query_planner_chain", _query_planner_template),
-    ("ideas_chain", _ideas_template),
-    ("selector_chain", _selector_template),
-    ("gaps_chain", _gaps_template),
-    ("methodology_chain", _methodology_template),
-    ("proposal_chain", _proposal_template),
-    ("critic_chain", _critic_template),
-    ("ranker_chain", _ranker_template),
-]
-
-for _name, _template in _MEMORY_CHAINS:
-    globals()[_name] = build_memory_chain(_template)
-
-
-
-# Paper QA — prompt templates + pure LCEL runnables
+query_planner_chain = _build_chain(_query_planner_template)
+ideas_chain = _build_chain(_ideas_template)
+selector_chain = _build_chain(_selector_template)
+gaps_chain = _build_chain(_gaps_template)
+methodology_chain = _build_chain(_methodology_template)
+proposal_chain = _build_chain(_proposal_template)
+critic_chain = _build_chain(_critic_template)
+ranker_chain = _build_chain(_ranker_template)
 
 
 _qa_template = ChatPromptTemplate.from_template(
-    """You are an AI Research Assistant.
+    """
+You are an AI Research Assistant.
 
-Answer the question ONLY from the research paper.
+Answer the question ONLY from the supplied research paper context.
 
 Context:
 {context}
@@ -323,15 +523,22 @@ Context:
 Question:
 {query}
 
-Answer clearly and accurately."""
+Rules:
+- Use only the supplied context.
+- If the answer is unavailable, clearly say so.
+- Do not invent information.
+- Give a clear and accurate answer.
+"""
 )
 
+
 _summary_template = ChatPromptTemplate.from_template(
-    """You are an AI Research Assistant.
+    """
+You are an AI Research Assistant.
 
-Summarize this paper.
+Summarize the research paper using ONLY the supplied context.
 
-Return:
+Include:
 
 1. Main Problem
 2. Proposed Method
@@ -340,15 +547,19 @@ Return:
 5. Conclusion
 
 Paper:
-{context}"""
+{context}
+"""
 )
 
-_methodology_paper_template = ChatPromptTemplate.from_template(
-    """You are an AI research analyst.
 
-Extract the methodology from the paper.
+_methodology_paper_template = ChatPromptTemplate.from_template(
+    """
+You are an AI research analyst.
+
+Extract the methodology from the supplied research paper.
 
 Include:
+
 - Model architecture
 - Algorithms
 - Training approach
@@ -356,16 +567,19 @@ Include:
 - Evaluation process
 
 Paper:
-{context}"""
+{context}
+"""
 )
 
-_gaps_paper_template = ChatPromptTemplate.from_template(
-    """You are an expert AI research analyst.
 
-Analyze this paper and identify:
+_gaps_paper_template = ChatPromptTemplate.from_template(
+    """
+You are an expert AI research analyst.
+
+Analyze the research paper and identify:
 
 1. Research limitations
-2. Weaknesses in methodology
+2. Methodology weaknesses
 3. Missing experiments
 4. Future work opportunities
 5. Potential improvements
@@ -373,52 +587,49 @@ Analyze this paper and identify:
 Return concise bullet points.
 
 Paper:
-{context}"""
+{context}
+"""
 )
 
-_literature_template = ChatPromptTemplate.from_template(
-    """You are an expert academic researcher.
 
-Generate a literature review.
+_literature_template = ChatPromptTemplate.from_template(
+    """
+You are an expert academic researcher.
+
+Generate a literature review based ONLY on the supplied paper context.
 
 Include:
+
 1. Existing approaches
 2. Previous methods
 3. Research gaps
 4. Comparison with proposed work
 
 Paper:
-{context}"""
+{context}
+"""
 )
 
 
-def _build_lcel_chain(template: ChatPromptTemplate) -> RunnableLambda:
-    """Build a pure ``prompt | llm | StrOutputParser`` runnable for Paper QA."""
-    return template | get_llm() | StrOutputParser()
-
-
-qa_chain = _build_lcel_chain(_qa_template)
-summary_chain = _build_lcel_chain(_summary_template)
-methodology_paper_chain = _build_lcel_chain(_methodology_paper_template)
-gaps_paper_chain = _build_lcel_chain(_gaps_paper_template)
-literature_chain = _build_lcel_chain(_literature_template)
-
-
-
-# Proper RAG chain (retriever-grounded) — used by the Paper QA pipeline
+qa_chain = _build_chain(_qa_template)
+summary_chain = _build_chain(_summary_template)
+methodology_paper_chain = _build_chain(_methodology_paper_template)
+gaps_paper_chain = _build_chain(_gaps_paper_template)
+literature_chain = _build_chain(_literature_template)
 
 
 def _format_docs(docs) -> str:
-    """Join retrieved LangChain documents into a single context string."""
-    return "\n\n".join(doc.page_content for doc in docs)
+    if not docs:
+        return ""
+
+    return "\n\n".join(
+        doc.page_content
+        for doc in docs
+        if getattr(doc, "page_content", None)
+    )
 
 
 def build_rag_chain(retriever):
-    """Build a canonical LCEL RAG chain: ``retrieve -> format -> prompt -> llm -> parser``.
-
-``retriever`` is any LangChain retriever (e.g. ``vectorstore.as_retriever(k=...)``).
-    The chain accepts a raw question string and streams the grounded answer.
-    """
     return (
         {
             "context": retriever | RunnableLambda(_format_docs),

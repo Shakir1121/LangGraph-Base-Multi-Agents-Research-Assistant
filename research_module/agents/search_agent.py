@@ -2,32 +2,44 @@ from research_module.tools.tavily_tool import tavily_search
 
 
 def search_agent(state):
-    query = state.get("query", "").strip()
+    query = str(state.get("query", "")).strip()
+
+    if not query:
+        return {
+            "web_context": "No research query was provided."
+        }
 
     try:
         results = tavily_search(query) or []
-    except Exception as e:
-        return {"web_context": f"Search failed: {str(e)}"}
+    except Exception as exc:
+        return {
+            "web_context": f"Search failed: {exc}"
+        }
 
     context_parts = []
 
-    for r in results:
-        if not isinstance(r, dict):
+    for result in results:
+        if not isinstance(result, dict):
             continue
 
         content = (
-            r.get("content")
-            or r.get("snippet")
-            or r.get("text")
-            or r.get("answer")
+            result.get("content")
+            or result.get("snippet")
+            or result.get("text")
+            or result.get("answer")
         )
 
         if content:
-            context_parts.append(content)
+            context_parts.append(str(content).strip())
 
-    web_context = "\n\n".join(context_parts).strip()
+    web_context = "\n\n".join(
+        part for part in context_parts if part
+    )
 
-    if not web_context:
-        web_context = "No relevant web context found."
-
-    return {"web_context": web_context}
+    return {
+        "web_context": (
+            web_context
+            if web_context
+            else "No relevant web context found."
+        )
+    }

@@ -1,35 +1,32 @@
 import logging
 import queue
+import re
 import threading
 from typing import Generator
 
-from langgraph.graph import StateGraph, END
+from langchain_core.callbacks import BaseCallbackHandler
+from langgraph.graph import END, StateGraph
 
-from research_module.graph.state import ResearchState
-
-from research_module.agents.search_agent import search_agent
-from research_module.agents.query_planner import query_planner_agent
-from research_module.agents.paper_ranker import paper_ranker_agent
-from research_module.agents.idea_agent import idea_agent
-from research_module.agents.idea_selector import selector_agent
-from research_module.agents.gap_agent import gap_agent
-from research_module.agents.methodology_agent import methodology_agent
-from research_module.agents.proposal_agent import proposal_agent
 from research_module.agents.critic_agent import critic_agent
 from research_module.agents.final_agent import final_agent
-
+from research_module.agents.gap_agent import gap_agent
+from research_module.agents.idea_agent import idea_agent
+from research_module.agents.idea_selector import selector_agent
+from research_module.agents.methodology_agent import methodology_agent
+from research_module.agents.paper_ranker import paper_ranker_agent
+from research_module.agents.proposal_agent import proposal_agent
+from research_module.agents.query_planner import query_planner_agent
+from research_module.agents.search_agent import search_agent
+from research_module.graph.state import ResearchState
 from research_module.retrievers.hybrid_retriever import hybrid_search
-
-from research_module.vectorstore.chroma_store import store_papers, retrieve
-
-from research_module.utils.final_builder import build_final_report
 from research_module.utils.cache_manager import get_global_cache
+from research_module.vectorstore.chroma_store import retrieve, store_papers
+
 
 logger = logging.getLogger(__name__)
 
 
-# Nodes that simply delegate to a single agent function (state -> dict).
-_AGENT_NODES = {
+AGENTS = {
     "planner": query_planner_agent,
     "ranker": paper_ranker_agent,
     "ideas": idea_agent,
@@ -40,8 +37,7 @@ _AGENT_NODES = {
     "critic": critic_agent,
 }
 
-# The research pipeline runs in this exact order.
-_WORKFLOW_SEQUENCE = [
+PIPELINE = [
     "search",
     "planner",
     "hybrid_retrieval",
@@ -58,277 +54,422 @@ _WORKFLOW_SEQUENCE = [
 ]
 
 
-def _ensure_session_id(state):
-    """Fall back to a deterministic id derived from the query when none is set."""
-    sid = state.get("session_id")
-    if sid:
-        return sid
-    query = state.get("query", "")
-    return str(abs(hash(query))) if query is not None else "default"
+NODE_LABELS = {
+    "search": ("🔍", "Searching web..."),
+    "planner": ("📋", "Planning search query..."),
+    "hybrid_retrieval": (
+        "📚",
+        "Retrieving papers from ArXiv, OpenAlex and Tavily...",
+    ),
+    "store": ("🗄️", "Storing research papers..."),
+    "retrieve": ("🔎", "Retrieving relevant papers..."),
+    "ranker": ("📊", "Ranking research papers..."),
+    "ideas": ("💡", "Generating 10 research ideas..."),
+    "select": ("⭐", "Selecting the strongest idea..."),
+    "gaps": ("🧩", "Identifying research gaps..."),
+    "methodology": ("🛠️", "Building methodology..."),
+    "proposal": ("📄", "Writing research proposal..."),
+    "critic": ("🧾", "Reviewing proposal..."),
+    "final": ("✅", "Research generation completed."),
+}
 
 
-def _search_node(cache):
-    def search_node(state):
-        state = {**state, "session_id": _ensure_session_id(state)}
-        return search_agent(state)
-    return search_node
+STREAM_SECTIONS = {
+    "ideas": ("## 💡 Research Ideas", "ideas"),
+    "select": ("## ⭐ Selected Research Idea", "selected_idea"),
+    "gaps": ("## 🧩 Research Gaps", "gaps"),
+    "methodology": ("## 🛠️ Proposed Methodology", "methodology"),
+    "proposal": ("## 📄 Research Proposal", "proposal"),
+    "critic": ("## 🧾 Critic Review", "review"),
+}
 
 
-def _hybrid_retrieval_node(cache):
-    """Multi-source retrieval: ArXiv, OpenAlex, and Tavily in parallel."""
+_GRAPH_APP = None
 
-    def hybrid_retrieval_node(state):
-        queries = state.get("search_queries")
-        if isinstance(queries, str):
-            queries = [q.strip() for q in queries.split("\n") if q.strip()]
-        elif not isinstance(queries, list):
-            queries = []
-        if not queries:
-            queries = [state["query"]]
 
-        all_arxiv, all_openalex, all_tavily = [], [], []
+def _get_session_id(state):
+    session_id = state.get("session_id")
 
-        for query in queries:
-            logger.info(f"🔄 Hybrid retrieval starting for: {query}")
+    if session_id:
+        return session_id
 
-            cache_key = f"hybrid_search:{query}"
-            results = cache.get(cache_key)
-            if results:
-                logger.info(f"📦 Using cached results for: {query}")
-            else:
-                results = hybrid_search(
-                    query, arxiv_limit=3, openalex_limit=3, tavily_limit=2
-                )
-                cache.set(cache_key, results)
+    query = str(state.get("query", "")).strip()
 
-            all_arxiv.extend(results.get("arxiv_papers", []))
-            all_openalex.extend(results.get("openalex_papers", []))
-            all_tavily.extend(results.get("tavily_papers", []))
+    return str(abs(hash(query)))
 
-        def deduplicate(papers):
-            seen, unique = set(), []
-            for p in papers:
-                title = p.get("title", "") if isinstance(p, dict) else str(p)
-                if title not in seen:
-                    seen.add(title)
-                    unique.append(p)
-            return unique
 
-        all_arxiv = deduplicate(all_arxiv)
-        all_openalex = deduplicate(all_openalex)
-        all_tavily = deduplicate(all_tavily)
+def _search_node(state):
+    state = {
+        **state,
+        "session_id": _get_session_id(state),
+    }
 
-        logger.info(
-            f"📥 Hybrid retrieval complete: "
-            f"ArXiv={len(all_arxiv)}, OpenAlex={len(all_openalex)}, Tavily={len(all_tavily)}"
+    return search_agent(state)
+
+
+def _hybrid_retrieval_node(state):
+    queries = state.get("search_queries", [])
+
+    if isinstance(queries, str):
+        queries = [
+            query.strip()
+            for query in queries.splitlines()
+            if query.strip()
+        ]
+
+    if not isinstance(queries, list):
+        queries = []
+
+    queries = queries[:1]
+
+    if not queries:
+        query = str(state.get("query", "")).strip()
+
+        if query:
+            queries = [query]
+
+    cache = get_global_cache()
+
+    arxiv_papers = []
+    openalex_papers = []
+    tavily_papers = []
+
+    for query in queries:
+        query = str(query).strip()
+
+        if not query:
+            continue
+
+        cache_key = f"hybrid_search:v2:{query.lower()}"
+        results = cache.get(cache_key)
+
+        if results is None:
+            results = hybrid_search(
+                query,
+                arxiv_limit=3,
+                openalex_limit=3,
+                tavily_limit=2,
+            )
+            cache.set(cache_key, results)
+
+        if not isinstance(results, dict):
+            continue
+
+        arxiv_papers.extend(
+            results.get("arxiv_papers", [])
+        )
+        openalex_papers.extend(
+            results.get("openalex_papers", [])
+        )
+        tavily_papers.extend(
+            results.get("tavily_papers", [])
         )
 
-        return {
-            "arxiv_papers": all_arxiv,
-            "openalex_papers": all_openalex,
-            "tavily_papers": all_tavily,
-        }
+    return {
+        "arxiv_papers": _deduplicate(arxiv_papers),
+        "openalex_papers": _deduplicate(openalex_papers),
+        "tavily_papers": _deduplicate(tavily_papers),
+    }
 
-    return hybrid_retrieval_node
+
+def _deduplicate(papers):
+    seen = set()
+    unique = []
+
+    for paper in papers:
+        if isinstance(paper, dict):
+            identity = str(
+                paper.get("title")
+                or paper.get("url")
+                or ""
+            ).strip().lower()
+        else:
+            identity = str(paper).strip().lower()
+
+        if not identity or identity in seen:
+            continue
+
+        seen.add(identity)
+        unique.append(paper)
+
+    return unique
 
 
 def _store_node(state):
-    """Persist all retrieved papers into the vector store."""
     papers = (
         state.get("arxiv_papers", [])
         + state.get("openalex_papers", [])
         + state.get("tavily_papers", [])
     )
+
     if papers:
         store_papers(papers)
-        logger.info(f"🗄️ store_node: stored {len(papers)} paper(s) in Chroma")
-    else:
-        logger.warning("🗄️ store_node: no papers to store")
+        logger.info("Stored %d papers.", len(papers))
+
     return {}
 
 
 def _retrieve_node(state):
-    """Retrieve the most relevant stored documents for the research query."""
-    docs = retrieve(state["query"], top_k=5) or []
-    if not docs:
-        logger.warning(
-            "🔍 retrieve_node: vector store returned 0 docs — "
-            "downstream ranking/ideation will be ungrounded."
-        )
-    else:
-        logger.info(f"🔍 retrieve_node: {len(docs)} doc(s) from vector store")
+    query = str(state.get("query", "")).strip()
+
+    if not query:
+        return {"retrieved_docs": []}
+
+    try:
+        docs = retrieve(query, top_k=5) or []
+    except Exception:
+        logger.exception("RAG retrieval failed.")
+        return {"retrieved_docs": []}
+
+    logger.info("Retrieved %d documents.", len(docs))
+
     return {"retrieved_docs": docs}
 
 
 def _final_node(state):
-    """Assemble the final report from all produced sections."""
-    final_state = {**state, **final_agent(state)}
-    final_state.update(build_final_report(final_state))
-    return final_state
+    try:
+        result = final_agent(state)
+
+        if isinstance(result, dict):
+            return result
+
+    except Exception:
+        logger.exception("Final agent failed.")
+
+    return {}
 
 
 def build_graph():
-    """Build and compile the LangGraph research workflow."""
-    cache = get_global_cache()
+    global _GRAPH_APP
+
+    if _GRAPH_APP is not None:
+        return _GRAPH_APP
 
     graph = StateGraph(ResearchState)
 
-    graph.add_node("search", _search_node(cache))
-    graph.add_node("hybrid_retrieval", _hybrid_retrieval_node(cache))
+    graph.add_node("search", _search_node)
+    graph.add_node("hybrid_retrieval", _hybrid_retrieval_node)
     graph.add_node("store", _store_node)
     graph.add_node("retrieve", _retrieve_node)
     graph.add_node("final", _final_node)
 
-    for name, agent in _AGENT_NODES.items():
+    for name, agent in AGENTS.items():
         graph.add_node(name, agent)
 
     graph.set_entry_point("search")
 
-    for a, b in zip(_WORKFLOW_SEQUENCE, _WORKFLOW_SEQUENCE[1:]):
-        graph.add_edge(a, b)
-    graph.add_edge(_WORKFLOW_SEQUENCE[-1], END)
+    for current, next_node in zip(
+        PIPELINE,
+        PIPELINE[1:],
+    ):
+        graph.add_edge(current, next_node)
 
-    return graph.compile()
+    graph.add_edge("final", END)
 
+    _GRAPH_APP = graph.compile()
 
-# Map each node to an icon + status label shown in the UI.
-_NODE_LABELS = {
-    "search": ("🔍", "Searching web for context..."),
-    "planner": ("📋", "Planning search queries..."),
-    "hybrid_retrieval": ("📚", "Retrieving papers (ArXiv, OpenAlex, Tavily)..."),
-    "store": ("🗄️", "Storing papers..."),
-    "retrieve": ("🔎", "Retrieving relevant documents..."),
-    "ranker": ("📊", "Ranking papers by relevance..."),
-    "ideas": ("💡", "Generating research ideas..."),
-    "select": ("⭐", "Selecting the best idea..."),
-    "gaps": ("🧩", "Identifying research gaps..."),
-    "methodology": ("🛠️", "Building methodology..."),
-    "proposal": ("📄", "Writing research proposal..."),
-    "critic": ("🧾", "Reviewing proposal..."),
-    "final": ("✅", "Assembling final report..."),
-}
-
-# Map each streamable node to its display header and state key.
-_NODE_STREAM_KEY = {
-    "ideas": ("## Research Ideas", "ideas"),
-    "select": ("## Selected Idea", "selected_idea"),
-    "gaps": ("## Research Gaps", "gaps"),
-    "methodology": ("## Methodology", "methodology"),
-    "proposal": ("## Research Proposal", "proposal"),
-    "critic": ("## Critic Review", "review"),
-}
+    return _GRAPH_APP
 
 
-def _assemble_report(state: dict, fallback_query: str) -> str:
-    """Build a human-readable report from the final graph state."""
-    sections = []
+def _remove_html(text):
+    if not text:
+        return ""
 
-    q = state.get("query") or fallback_query
-    if q:
-        sections.append(f"# Research Topic\n{q}")
+    text = re.sub(
+        r"<[^>]+>",
+        "",
+        str(text),
+    )
 
-    if state.get("search_queries"):
-        sq = state["search_queries"]
-        if isinstance(sq, list):
-            sq = "\n".join(f"- {x}" for x in sq)
-        sections.append(f"## Search Queries\n{sq}")
-
-    for header, key in _NODE_STREAM_KEY.values():
-        if state.get(key):
-            sections.append(f"{header}\n{state[key]}")
-
-    if not sections:
-        return "No output generated. Please try again with a more specific research topic."
-
-    return "\n\n".join(sections)
+    return text.strip()
 
 
-from langchain_core.callbacks import BaseCallbackHandler
+def _clean_output(text):
+    text = _remove_html(text)
+
+    if not text:
+        return ""
+
+    text = re.sub(
+        r"\n*##\s*10\.\s*Research Evidence Status.*?(?=\n##\s|\Z)",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    text = re.sub(
+        r"\n*Retrieved research documents used:\s*\**\d+\**.*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text,
+    )
+
+    return text.strip()
 
 
-class _StopGeneration(Exception):
-    """Raised inside the callback handler when the user cancels generation."""
+class StopGeneration(Exception):
+    pass
 
 
-class _ResearchStreamHandler(BaseCallbackHandler):
-    """Capture LLM tokens + node progress during a blocking graph invoke.
+class ResearchStreamHandler(BaseCallbackHandler):
 
-    ``stop_event`` lets the UI cancel generation: once set, the handler raises
-    :class:`_StopGeneration` at the next node boundary, aborting the remaining
-    graph steps.
-    """
-
-    def __init__(self, out_queue: "queue.Queue", stop_event: threading.Event | None = None):
-        self.out_queue = out_queue
-        self.final_state: dict = {}
-        self.active_node = None
+    def __init__(self, output_queue, stop_event=None):
+        self.output_queue = output_queue
         self.stop_event = stop_event
-        self._sections: dict = {}
+        self.final_state = {}
+        self.active_node = None
+        self.sections = {}
 
-    def on_chain_start(self, serialized, inputs, *, run_id=None, **kwargs):
+    def on_chain_start(
+        self,
+        serialized,
+        inputs,
+        *,
+        run_id=None,
+        **kwargs,
+    ):
         metadata = kwargs.get("metadata") or {}
         node = metadata.get("langgraph_node")
+
         if not node or node == self.active_node:
             return
-        self.active_node = node
-        icon, label = _NODE_LABELS.get(node, ("⚙️", f"Running {node}..."))
-        self.out_queue.put(
-            {"type": "node_start", "node": node, "icon": icon, "label": label}
-        )
-        if node in _NODE_STREAM_KEY:
-            header, _key = _NODE_STREAM_KEY[node]
-            self._sections[node] = {"header": header, "open": False}
 
-    def on_llm_new_token(self, token, *, run_id=None, **kwargs):
+        self.active_node = node
+
+        icon, label = NODE_LABELS.get(
+            node,
+            ("⚙️", f"Running {node}..."),
+        )
+
+        self.output_queue.put({
+            "type": "node_start",
+            "node": node,
+            "icon": icon,
+            "label": label,
+        })
+
+        if node in STREAM_SECTIONS:
+            header, _ = STREAM_SECTIONS[node]
+
+            self.sections[node] = {
+                "header": header,
+                "open": False,
+            }
+
+    def on_llm_new_token(
+        self,
+        token,
+        *,
+        run_id=None,
+        **kwargs,
+    ):
         if not token:
             return
-        node = self.active_node
-        info = self._sections.get(node)
-        if info is None:
-            return
-        if not info["open"]:
-            info["open"] = True
-            self.out_queue.put(
-                {"type": "section_open", "node": node, "header": info["header"]}
-            )
-        self.out_queue.put({"type": "token", "node": node, "token": token})
 
-    def on_chain_end(self, output, *, run_id=None, **kwargs):
+        section = self.sections.get(
+            self.active_node
+        )
+
+        if section is None:
+            return
+
+        if not section["open"]:
+            section["open"] = True
+
+            self.output_queue.put({
+                "type": "section_open",
+                "node": self.active_node,
+                "header": section["header"],
+            })
+
+        self.output_queue.put({
+            "type": "token",
+            "node": self.active_node,
+            "token": token,
+        })
+
+    def on_chain_end(
+        self,
+        output,
+        *,
+        run_id=None,
+        **kwargs,
+    ):
         metadata = kwargs.get("metadata") or {}
         node = metadata.get("langgraph_node")
+
         if isinstance(output, dict):
             self.final_state.update(output)
-        if node in _NODE_STREAM_KEY:
-            header, key = _NODE_STREAM_KEY[node]
-            content = output.get(key) if isinstance(output, dict) else None
+
+        if node in STREAM_SECTIONS:
+            header, state_key = STREAM_SECTIONS[node]
+
+            content = None
+
+            if isinstance(output, dict):
+                content = output.get(state_key)
+
             if not content:
-                content = self.final_state.get(key)
+                content = self.final_state.get(state_key)
+
             if content:
-                self.out_queue.put(
-                    {"type": "section", "header": header, "content": str(content).strip()}
-                )
-            self._sections.pop(node, None)
-        if node and self.stop_event and self.stop_event.is_set():
-            raise _StopGeneration()
+                content = _clean_output(str(content))
+
+                if content:
+                    self.output_queue.put({
+                        "type": "section",
+                        "header": header,
+                        "content": content,
+                    })
+
+            self.sections.pop(node, None)
+
+        if self.stop_event and self.stop_event.is_set():
+            raise StopGeneration()
 
 
 def _worker(
     graph_app,
-    initial_state: dict,
-    out_queue: "queue.Queue",
-    stop_event: threading.Event | None = None,
+    initial_state,
+    output_queue,
+    stop_event,
 ):
-    """Run the graph via a blocking invoke with a streaming callback handler."""
-    handler = _ResearchStreamHandler(out_queue, stop_event)
+    handler = ResearchStreamHandler(
+        output_queue,
+        stop_event,
+    )
+
     try:
-        graph_app.invoke(initial_state, config={"callbacks": [handler]})
-    except _StopGeneration:
-        logger.info("stream_research: generation cancelled by user")
+        graph_app.invoke(
+            initial_state,
+            config={
+                "callbacks": [handler],
+            },
+        )
+
+    except StopGeneration:
+        logger.info("Research generation stopped.")
+
     except Exception as exc:
-        logger.error("stream_research invoke failed: %s", exc)
-        out_queue.put({"type": "error", "message": str(exc)})
-    out_queue.put({"type": "__final__", "state": handler.final_state})
-    out_queue.put(None)
+        logger.exception("Research graph failed.")
+
+        output_queue.put({
+            "type": "error",
+            "message": str(exc),
+        })
+
+    output_queue.put({
+        "type": "__final__",
+        "state": handler.final_state,
+    })
+
+    output_queue.put(None)
 
 
 def stream_research(
@@ -336,15 +477,18 @@ def stream_research(
     session_id: str | None = None,
     stop_event: threading.Event | None = None,
 ) -> Generator[dict, None, None]:
-    """Run the research graph, streaming LLM tokens live for a typing effect.
 
-    ``stop_event`` may be set by the caller to cancel generation early.
+    query = str(query or "").strip()
 
-    Yields dicts:
-        {"type": "node_start" | "section_open" | "token" | "section" | "done",
-         ...}
-    """
+    if not query:
+        yield {
+            "type": "error",
+            "message": "Research topic is empty.",
+        }
+        return
+
     graph_app = build_graph()
+
     session_id = session_id or str(abs(hash(query)))
 
     initial_state: ResearchState = {
@@ -352,31 +496,39 @@ def stream_research(
         "session_id": session_id,
     }
 
-    out_queue: "queue.Queue" = queue.Queue()
-    thread = threading.Thread(
+    output_queue = queue.Queue()
+
+    worker = threading.Thread(
         target=_worker,
-        args=(graph_app, initial_state, out_queue, stop_event),
+        args=(
+            graph_app,
+            initial_state,
+            output_queue,
+            stop_event,
+        ),
         daemon=True,
     )
-    thread.start()
 
-    final_state: dict = {}
+    worker.start()
+
+    final_state = {}
+
     while True:
-        item = out_queue.get()
+        item = output_queue.get()
+
         if item is None:
             break
+
         if item.get("type") == "__final__":
             final_state = item.get("state") or {}
             continue
+
         yield item
 
-    thread.join(timeout=30)
+    worker.join(timeout=30)
 
-    raw_output = (
-        final_state.get("final_output")
-        or final_state.get("final_report")
-        or _assemble_report(final_state, query)
-    )
-    raw_output = str(raw_output or "").strip()
-
-    yield {"type": "done", "final_output": raw_output}
+    yield {
+        "type": "done",
+        "final_output": "",
+        "state": final_state,
+    }
