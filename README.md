@@ -641,57 +641,11 @@ Open the URL in your browser to use the application.
 
 ---
 
-# 📦 Project Requirements
-
-The project requires Python and the dependencies listed in:
-
-```text
-requirements.txt
-```
-
-Install them using:
-
-```bash
-pip install -r requirements.txt
-```
-
----
-
-# 🔐 GitHub Security
-
-The following files and directories should not be uploaded to GitHub:
-
-```text
-.env
-venv/
-__pycache__/
-*.pyc
-.research_cache/
-```
-
-API keys must always be stored in environment variables.
-
-The source-code directories such as:
-
-```text
-vector_store/
-research_module/
-langgraph_flow/
-agents/
-embeddings/
-pdf_processing/
-```
-
-are part of the project and should remain in the repository.
-
----
-
 # 🎓 Use Cases
 
 This project can be useful for:
 
-- MS Computer Science students
-- PhD students
+- MS or PhD students
 - AI/ML researchers
 - Academic researchers
 - Research paper analysis
@@ -752,20 +706,3 @@ Future versions can include:
 
 ---
 
-# 👨‍💻 Author
-
-**Shakir**
-
-Multi-Agent AI Research Assistant built with:
-
-**Python • LangChain • LangGraph • RAG • LLMs • ChromaDB • Streamlit**
-
----
-
-# ⭐ Support
-
-If you find this project useful, please consider giving the repository a ⭐ on GitHub.
-
-**GitHub Repository:**
-
-https://github.com/Shakir1121/LangGraph-Base-Multi-Agents-Research-Assistant
