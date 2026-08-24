@@ -617,7 +617,7 @@ Create a `.env` file in the project root.
 Example:
 
 ```env
-GROQ_API_KEY=your_groq_api_key
+MISTRAL_API_KEY=your_mistral_api_key
 TAVILY_API_KEY=your_tavily_api_key
 ```
 
