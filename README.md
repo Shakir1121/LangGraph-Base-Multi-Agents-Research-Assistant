@@ -389,7 +389,6 @@ The project contains vector-store code for storing and retrieving research infor
 The project uses:
 
 - ChromaDB
-- FAISS
 - Sentence Transformers
 
 The `vector_store/` directory contains Python source code and is part of the project.
@@ -452,56 +451,6 @@ Final Output
 ```
 
 This provides a more interactive experience similar to modern AI chat applications.
-
----
-
-# 🎯 Complete Example
-
-## User Input
-
-```text
-LLM-based Text Summarization
-```
-
-The system generates 10 research ideas.
-
-One example is:
-
-### Dynamic Knowledge Graph-Augmented Summarization
-
-The idea combines LLM-based text summarization with dynamic knowledge graphs to improve:
-
-- Factual accuracy
-- Context understanding
-- Explainability
-- Personalization
-- Domain adaptation
-
-The system can then develop this idea through multiple stages:
-
-```text
-Research Idea
-      ↓
-Best Idea Selection
-      ↓
-Research Gap
-      ↓
-Research Questions
-      ↓
-Methodology
-      ↓
-Dataset
-      ↓
-Expected Results
-      ↓
-Research Contributions
-      ↓
-Complete Proposal
-      ↓
-Critic Review
-      ↓
-Final Research Report
-```
 
 ---
 
